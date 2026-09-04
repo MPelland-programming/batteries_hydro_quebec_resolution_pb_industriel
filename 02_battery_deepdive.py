@@ -173,23 +173,25 @@ def _(mo):
         value=0,
         on_click=lambda v: v + 1,
     )
-    return prev_btn, next_btn
+    return next_btn, prev_btn
 
 
 @app.cell
-def _(filtered, mo, n_per_page, prev_btn, next_btn, total_pages):
+def _(filtered, mo, n_per_page, next_btn, prev_btn, total_pages):
     page = 1 + next_btn.value - prev_btn.value
     page = max(1, min(page, total_pages))
     start_idx = (page - 1) * n_per_page
     end_idx = min(start_idx + n_per_page, len(filtered))
 
     mo.hstack([prev_btn, mo.md(f"Page {page}/{total_pages}"), next_btn], gap=1)
-    return end_idx, page, start_idx
+    return end_idx, start_idx
 
 
 @app.cell
 def _(mo):
-    mo.md("## Grille SOH par batterie")
+    mo.md("""
+    ## Grille SOH par batterie
+    """)
     return
 
 
@@ -227,11 +229,11 @@ def _(df_clean, display_names, end_idx, filtered, mo, n_cols, plt, start_idx):
 
     plt.tight_layout()
     plt.gca()
-    return page_cells, n_cols
+    return (page_cells,)
 
 
 @app.cell
-def _(display_names, mo, n_cols, page_cells, set_sel):
+def _(mo, n_cols, page_cells, set_sel):
     _n_items = len(page_cells)
     _n_rows = max(1, -(-_n_items // n_cols))
 
@@ -260,7 +262,9 @@ def _(display_names, mo, n_cols, page_cells, set_sel):
 
 @app.cell
 def _(mo):
-    mo.md("## Recherche et analyse detaillee")
+    mo.md("""
+    ## Recherche et analyse detaillee
+    """)
     return
 
 
@@ -326,7 +330,7 @@ def _(mo):
     metric_labels = {
         "SOH_Energy (%)": ("SOH", "%"),
         "Polarization (Ohm cm\u00b2)": ("Polarization", "\u03a9\u00b7cm\u00b2"),
-        "Avg_Charge_Current (A)": ("Courant charge", "A"),
+        "Avg_Charge_Current (A)": ("Average charge current", "A"),
         "Discharge_Capacity (mAh)": ("Capacite decharge", "mAh"),
         "Charge_Capacity (mAh)": ("Capacite charge", "mAh"),
         "Avg_Discharge_Voltage (V)": ("Tension decharge", "V"),
@@ -342,7 +346,7 @@ def _(mo):
         label="Metriques a afficher",
     )
     metric_sel
-    return metric_labels, metric_opts, metric_sel
+    return metric_labels, metric_sel
 
 
 @app.cell
