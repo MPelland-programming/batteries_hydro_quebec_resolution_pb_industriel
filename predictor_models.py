@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import math
 
 # How to use the code
 #
@@ -36,13 +37,7 @@ class predictor_models:
 
     def __init__(self, indata):
         self.indata = indata
-        # BUG (qualité / logique): test_size=0.9 signifie 90% en validation, 10% en train — probablement inversé.
-        # De plus, train_data et valid_data ne sont jamais réutilisés nulle part dans la classe (les folds prennent le relais).
-        # FIX: commenté — ligne sans effet sur l'exécution. À discuter avec l'auteur (supprimer ou corriger test_size=0.1).
-        # self.train_data, self.valid_data = train_test_split(self.indata, test_size=0.9)
-        # BUG (qualité): create_folds() assigne self.folds en interne mais ne retourne rien (retourne None implicitement).
-        # self.fold (sans 's') valait donc None et n'était jamais réutilisé — c'est self.folds (avec 's') qui est utilisé partout.
-        # FIX: suppression de l'assignation inutile.
+        self.train_data, self.valid_data = train_test_split(self.indata, test_size=0.9)
         self.create_folds()
 
         self.xtensor = torch.tensor(
@@ -57,12 +52,16 @@ class predictor_models:
             "lognorm": self.fit_lognorm,
             "neuralnet1layer": self.fit_neuralnet1,
             "neuralnet2layer": self.fit_neuralnet2,
+            "neuralnet2layer_lnorm_lrt_loss": self.fit_neuralnet2_lnorm_lrt_loss
         }
 
-    def loss_fx(self, ypred, ytrue, censoring):
-        # là ici tu peux juste utiliser censoring.
-        # tu dis uncensored = 1 si censoring == 1, 0 sinon
-        # censored = 1 si censoring == 0, 0 sinon, donc censored c'est !censoring
+        self.lossdict = {
+            "mse": self.mse,
+            "lnorm_lrt": self.lnorm_lrt
+        }
+
+    def mse(self, modeled=0, ytrue=0, censoring=0):
+        ypred = modeled.squeeze()
         uncensored = censoring == 1
         censored = censoring == 0
 
@@ -80,6 +79,22 @@ class predictor_models:
         )
 
         return uncensored_loss + censored_loss
+
+    def lnorm_lrt(self, modeled={}, ytrue = None, censoring=0, eps = 1e-8):
+        mu = modeled["mu"]
+        sigma = modeled["sigma"]
+
+        log_t = torch.log(ytrue.clamp_min(eps))
+        z = (log_t + mu) / sigma
+
+        # log density of T: Normal log-pdf of log t, minus log t (Jacobian)
+        log_f = -0.5 * z ** 2 - 0.5 * math.log(2 * math.pi) - torch.log(sigma)- log_t
+
+        # log survival: log(1 - Phi(z)) = log Phi(-z), stable in the tail
+        log_S = torch.special.log_ndtr(-z)
+
+        ll = censoring * log_f + (1 - censoring) * log_S
+        return -ll.mean()
 
     def create_folds(self, nfolds=20):
         rng = np.random.default_rng(42)
@@ -103,7 +118,6 @@ class predictor_models:
                 ttrain,
                 duration_col="ncycles",
                 event_col="censoring",
-                # label="ExponentialFitter",  # paramètre inexistant sur AFTFitter (existe sur KaplanMeierFitter)
             )
             y_pred = model.predict_percentile(tval[tval["censoring"] == 1])
             y_true = ctval["ncycles"]
@@ -114,13 +128,11 @@ class predictor_models:
             self.indata,
             duration_col="ncycles",
             event_col="censoring",
-            # label="ExponentialFitter",  # paramètre inexistant sur AFTFitter (existe sur KaplanMeierFitter)
         )
 
         return mae / np.sum(self.indata["censoring"])
 
     def fit_gengamma(self):
-        # same as for fit weibul but with generalized gamma
         mae = 0
         for ff in self.folds:
             ttrain = self.indata.iloc[ff[1]]
@@ -135,7 +147,6 @@ class predictor_models:
                 ttrain,
                 duration_col="ncycles",
                 event_col="censoring",
-                # label="GenGammaFitter",  # paramètre inexistant sur AFTFitter (existe sur KaplanMeierFitter)
             )
             y_pred = model.predict_percentile(tval[tval["censoring"] == 1])
             y_true = ctval["ncycles"]
@@ -148,13 +159,11 @@ class predictor_models:
             self.indata,
             duration_col="ncycles",
             event_col="censoring",
-            # label="GenGammaFitter",  # paramètre inexistant sur AFTFitter (existe sur KaplanMeierFitter)
         )
 
         return mae / np.sum(self.indata["censoring"])
 
     def fit_lognorm(self):
-        # same as for fit weibul but with generalized gamma
         mae = 0
         for ff in self.folds:
             ttrain = self.indata.iloc[ff[1]]
@@ -167,7 +176,6 @@ class predictor_models:
                 ttrain,
                 duration_col="ncycles",
                 event_col="censoring",
-                # label="LogNormFitter",  # paramètre inexistant sur AFTFitter (existe sur KaplanMeierFitter)
             )
             y_pred = model.predict_percentile(tval[tval["censoring"] == 1])
             y_true = ctval["ncycles"]
@@ -178,14 +186,11 @@ class predictor_models:
             self.indata,
             duration_col="ncycles",
             event_col="censoring",
-            # label="LogNormFitter",  # paramètre inexistant sur AFTFitter (existe sur KaplanMeierFitter)
         )
 
         return mae / np.sum(self.indata["censoring"])
 
-    def train_net(self, model, xx, yy, cc):
-        # BUG (crash): cuda n'est pas importé directement depuis torch — torch.cuda.is_available() lèvera NameError.
-        # FIX: remplacer par torch.torch.cuda.is_available()
+    def train_net(self, model, xx, yy, cc, loss_fx="mse"):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         lr = 0.001
         epochs = 10
@@ -200,21 +205,17 @@ class predictor_models:
         model.train()
         for epoch in range(epochs):
             optimizer.zero_grad()
-            ypred = model(xx)
-            loss = self.loss_fx(ypred.squeeze(), yy, cc)
+            modeled = model(xx)
+            loss = self.lossdict[loss_fx](modeled = modeled, ytrue = yy, censoring  = cc)
             loss.backward()
             optimizer.step()
 
         return model
 
     def fit_neuralnet1(self):
-        # BUG (crash): df n'est pas défini dans ce scope — lèvera NameError à l'exécution.
-        # FIX: remplacer par self.indata.shape[1] - 2 ou self.xtensor.shape[1]
         input_dim = self.xtensor.shape[1]
 
         class nnregr(nn.Module):
-            # BUG (crash): hidden_dim déclaré dans la signature mais jamais utilisé + jamais passé à l'instanciation → TypeError.
-            # FIX: hidden_dim=1 par défaut (comportement identique), utilisé dans Linear.
             def __init__(self, input_dim, hidden_dim=1):
                 super(nnregr, self).__init__()
                 self.lin1 = nn.Linear(input_dim, hidden_dim)
@@ -222,8 +223,6 @@ class predictor_models:
             def forward(self, x):
                 return F.relu(self.lin1(x))
 
-        # BUG (crash): même cause que train_net — cuda non importé directement.
-        # FIX: torch.torch.cuda.is_available()
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         ypred = torch.empty(0)
@@ -241,25 +240,19 @@ class predictor_models:
 
             model = nnregr(input_dim)
 
-            trained_m = self.train_net(model, tx, ty, tc)
+            trained_m = self.train_net(model, tx, ty, tc, loss_fx="mse")
 
             trained_m.eval()
             with torch.no_grad():
-                # BUG (crash): .to('cpu') est appelé sur le tuple (ypred, ...) et non sur le tenseur retourné par le modèle.
-                # Cause: la parenthèse fermante de torch.cat est mal placée — elle englobe le tuple au lieu de le fermer avant .to().
-                # FIX: torch.cat((ypred, trained_m(vx.to(device)).to('cpu')), 0)
                 ypred = torch.cat((ypred, trained_m(vx.to(device)).to("cpu")), 0)
                 ytrue = torch.cat((ytrue, vy), 0)
                 cens = torch.cat((cens, vc), 0)
 
         with torch.no_grad():
             mask = cens == 1
-            # np.sum(abs(ypred[mask] - ytrue[mask]))  # BUG (qualité): résultat calculé mais jamais assigné — code mort.
             return torch.mean(abs(ypred[mask] - ytrue[mask]))
 
     def fit_neuralnet2(self):
-        # BUG (crash): df n'est pas défini dans ce scope — lèvera NameError à l'exécution.
-        # FIX: remplacer par self.indata.shape[1] - 2 ou self.xtensor.shape[1]
         input_dim = self.xtensor.shape[1]
         hidden_dim = np.floor(input_dim / 4).astype(int)
         if hidden_dim < 2:
@@ -277,8 +270,6 @@ class predictor_models:
                 x = self.drop(x)
                 return F.relu(self.lin2(x))
 
-        # BUG (crash): même cause que train_net — cuda non importé directement.
-        # FIX: torch.torch.cuda.is_available()
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         ypred = torch.empty(0)
@@ -294,25 +285,67 @@ class predictor_models:
             vc = self.ctensor[ff[0]]
             vy = self.ytensor[ff[0]]
 
-            # BUG (crash): nnregr.__init__ requiert (input_dim, hidden_dim) mais hidden_dim n'était pas passé ici.
-            # hidden_dim est pourtant calculé quelques lignes au-dessus — c'est un oubli d'argument.
-            # FIX: nnregr(input_dim, hidden_dim)
             model = nnregr(input_dim, hidden_dim)
 
-            trained_m = self.train_net(model, tx, ty, tc)
+            trained_m = self.train_net(model, tx, ty, tc, loss_fx="mse")
 
             trained_m.eval()
             with torch.no_grad():
-                # BUG (crash): même erreur que fit_neuralnet1 — .to('cpu') appliqué sur le tuple, pas sur le tenseur.
-                # FIX: torch.cat((ypred, trained_m(vx.to(device)).to('cpu')), 0)
                 ypred = torch.cat((ypred, trained_m(vx.to(device)).to("cpu")), 0)
                 ytrue = torch.cat((ytrue, vy), 0)
                 cens = torch.cat((cens, vc), 0)
 
         with torch.no_grad():
             mask = cens == 1
-            # np.sum(abs(ypred[mask] - ytrue[mask]))  # BUG (qualité): résultat calculé mais jamais assigné — code mort.
             return torch.mean(abs(ypred[mask] - ytrue[mask]))
+
+    def fit_neuralnet2_lnorm_lrt_loss(self):
+        input_dim = self.xtensor.shape[1]
+        hidden_dim = np.floor(input_dim / 4).astype(int)
+        if hidden_dim < 2:
+            hidden_dim = 2
+
+        class nnregr(nn.Module):
+            def __init__(self, input_dim, hidden_dim):
+                super(nnregr, self).__init__()
+                self.lin1 = nn.Linear(input_dim, hidden_dim)
+                self.lin2 = nn.Linear(hidden_dim, 2)
+                self.drop = nn.Dropout(0.2)
+
+            def forward(self, x):
+                x = F.relu(self.lin1(x))
+                x = self.drop(x)
+                x = self.lin2(x)
+                return {'mu':x[0], 'sigma':F.softplus(x[1]) + 1e-6}  # Ensure sigma is positive
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        ypred = torch.empty(0)
+        ytrue = torch.empty(0)
+        cens = torch.empty(0)
+
+        for ff in self.folds:
+            tx = self.xtensor[ff[1]]
+            tc = self.ctensor[ff[1]]
+            ty = self.ytensor[ff[1]]
+
+            vx = self.xtensor[ff[0]]
+            vc = self.ctensor[ff[0]]
+            vy = self.ytensor[ff[0]]
+
+            model = nnregr(input_dim, hidden_dim)
+
+            trained_m = self.train_net(model, tx, ty, tc, loss_fx="lnorm_lrt")
+
+            trained_m.eval()
+            with torch.no_grad():
+                params = trained_m(vx.to(device)).to("cpu")
+                npred = torch.exp((params['sima']**2)/2)/params["mu"]
+                ypred = torch.cat((ypred, npred ), 0)
+                ytrue = torch.cat((ytrue, vy), 0)
+
+        with torch.no_grad():
+            return torch.mean(abs(ypred - ytrue))
 
     def extract_models_mae(
         self,
@@ -322,22 +355,16 @@ class predictor_models:
             "lognorm",
             "neuralnet1layer",
             "neuralnet2layer",
+            "neuralnet2layer_lnorm_lrt_loss",
         ],
     ):
         """
         :param model_list: It does not, by default, run the neural nets.
         :return:
         """
-        # create empty dataframe pd with as many rows as model_list lenght and two columns: model and mae
         maedf = pd.DataFrame({"model": model_list, "mae": [None] * len(model_list)})
 
         for mm in model_list:
-            # BUG (logique silencieux): double problème ici.
-            # 1. Chained indexing pandas : maedf[...]["mae"] = ... ne modifie pas maedf en place (SettingWithCopyWarning silencieux).
-            #    L'assignation se fait sur une copie temporaire — toutes les valeurs mae restent None.
-            # 2. Le filtre était sur la chaîne littérale "weibul" au lieu de la variable mm
-            #    → même avec un fix du chained indexing, seule la ligne weibul aurait été mise à jour.
-            # FIX: maedf.loc avec mm comme variable.
             maedf.loc[maedf["model"] == mm, "mae"] = self.modeldict[mm]()
 
         return maedf
